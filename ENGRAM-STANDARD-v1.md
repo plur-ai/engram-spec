@@ -108,7 +108,7 @@ sequence of engram objects:
 
 ```yaml
 engrams:
-  - id: ENG-2026-0506-001
+  - id: ENG-2026-05-06-001
     statement: "toEqual() in Vitest is strict — use toMatchObject() for partial matching"
     type: behavioral
     status: active
@@ -175,30 +175,70 @@ As a regular expression (the reference validator):
 ### 3.3 Canonical concrete form
 
 While the grammar permits any `[A-Za-z0-9-]+` body, the RECOMMENDED canonical
-form for a freshly minted concrete engram is date-sequenced:
+form for a freshly minted concrete engram is date-sequenced with full ISO-8601
+date separators — the SAME form whether the id is minted locally or assigned
+by a server (plur-ai/plur#771):
 
 ```
-ENG-YYYY-MMDD-NNN
+ENG-YYYY-MM-DD-NNN
 ```
 
-- `YYYY` four-digit year, `MMDD` month+day, `NNN` a zero-padded per-day
-  sequence number starting at `001`.
-- Example: `ENG-2026-0506-003`.
+- `YYYY-MM-DD` ISO-8601 calendar date (UTC at mint time), `NNN` a zero-padded
+  per-day sequence number starting at `001`.
+- Example: `ENG-2026-05-06-003`.
+
+#### 3.3.1 Legacy compact form
+
+Reference releases before the #771 convergence minted *local* ids with a
+compact date while servers assigned the full-date form above, producing two
+shapes for the same logical scheme:
+
+```
+ENG-YYYY-MMDD-NNN                 e.g.  ENG-2026-0506-003   (legacy, local)
+```
+
+Compact ids remain VALID forever — they match the §3.1 grammar, existing
+stores containing them need NO migration, and consumers MUST accept both the
+full-date and compact forms wherever a date-sequenced id is parsed (e.g. the
+reference's `engramDate()` treats the day separator as optional).
+Implementations MUST NOT mint new compact ids.
+
+#### 3.3.2 Pack form
+
+Engrams shipped in curated packs use a dateless, human-assigned form:
+
+```
+ENG-PACK-{NAME}-NNN               e.g.  ENG-PACK-EM-006
+```
+
+where `{NAME}` is a short uppercase abbreviation of the pack name. This is an
+INTENTIONAL exemption from the date-sequenced scheme: pack content is
+versioned by the pack manifest, not by mint date, and ids must stay stable
+across pack releases so installs and upgrades can be diffed. Pack ids match
+the §3.1 grammar. The `ABS-` and `META-` class prefixes (§3.2) combine with
+every form in this section the same way (e.g. `ABS-PACK-EM-001`,
+`META-2026-05-06-001`).
 
 ### 3.4 Store-namespaced form
 
 When engrams from multiple stores are merged, an implementation MAY namespace an
-ID with a short store **PREFIX** to avoid collisions:
+ID with a short store **PREFIX** to avoid collisions. The prefix is inserted
+directly after the class prefix; the rest of the id — whichever §3.3 form the
+source store minted — is preserved verbatim:
 
 ```
-ENG-{PREFIX}-YYYY-MMDD-NNN        e.g.  ENG-DF-2026-0401-001
+ENG-{PREFIX}-YYYY-MM-DD-NNN       e.g.  ENG-GPL-2026-07-30-032
+ENG-{PREFIX}-YYYY-MMDD-NNN        e.g.  ENG-DF-2026-0401-001   (legacy source id)
 ```
 
-`PREFIX` is a SHORT uppercase token derived from the source scope. The
-namespaced form still matches the grammar in §3.1. Implementations MUST treat
-the namespaced and bare forms as referring to *different* logical engrams once
-namespacing has been applied (the prefix is part of the identity in a merged
-view). Pack producers SHOULD export *bare* IDs.
+`PREFIX` is a SHORT uppercase token derived from the source scope (the
+reference derives exactly three characters via `storePrefix()`, e.g.
+`group:plur/engineering` → `GPL`-style abbreviations, and detects namespaced
+ids with `^(ENG|ABS|META)-[A-Z]{3}-`). The namespaced form still matches the
+grammar in §3.1. Implementations MUST treat the namespaced and bare forms as
+referring to *different* logical engrams once namespacing has been applied
+(the prefix is part of the identity in a merged view). Pack producers SHOULD
+export *bare* IDs.
 
 ### 3.5 Uniqueness
 
@@ -235,6 +275,27 @@ destroying any.
 | `type` | string | **R** | `behavioral` \| `terminological` \| `procedural` \| `architectural` | Top-level knowledge class. |
 | `scope` | string | **R** | free-form | Hierarchical namespace. Convention: `kind:path`, e.g. `global`, `project:my-app`, `group:plur/test`. |
 | `visibility` | string | | `private` \| `public` \| `template`, default `private` | Sharing posture. `private` engrams MUST NOT be exported (§5.4). `template` = shippable skeleton. |
+| `created_at` | string | | RFC 3339 instant | Timestamp of first mint. Immutable. |
+| `updated_at` | string | | RFC 3339 instant | Timestamp of the last mutation to content or lifecycle. |
+
+Both timestamps are OPTIONAL and deliberately **not** defaulted. An
+implementation MUST NOT synthesise `created_at` at load time for an engram that
+lacks it: a default stamps the load date onto every legacy record and destroys
+the provenance the field exists to carry. Absent means genuinely unknown.
+
+`updated_at` tracks mutation of the engram's *content or lifecycle* — statement,
+scope, commitment, relations, retirement. It MUST NOT be moved by reads, decay,
+injection, or feedback; those change `activation` and `usage`, which are
+separate state carrying their own timestamps. An implementation that bumps
+`updated_at` on read makes it indistinguishable from `activation.last_accessed`
+and useless for provenance.
+
+> **Added 2026-09-07.** Before this the object had no canonical creation time.
+> `sources[].stored_at` records a timestamp per write but is optional: a real
+> 5,477-engram store carried one on 2,765 of them, and `temporal.learned_at` on
+> 12. Consumers were left parsing the mint date out of the identifier — which is
+> date-only, is absent for any id not in the canonical form of §3.3, and is
+> wrong for a migrated or store-namespaced engram.
 
 ### 4.3 Content
 
@@ -365,10 +426,11 @@ ignore the values.
 | Field | Type | Range / enum | Semantics |
 |---|---|---|---|
 | `content_hash` | string | | Hash of normalized statement, for dedup. |
-| `commitment` | string | `exploring` \| `leaning` \| `decided` \| `locked` | Epistemic commitment level. |
+| `commitment` | string | `exploring` \| `leaning` \| `decided` \| `locked` \| `draft` | Epistemic commitment level. `draft` marks the engram as pending human approval — core stores and recalls it normally; enforcement is left to deployments with a review queue. |
 | `locked_at` | string | | When commitment became `locked`. |
 | `locked_reason` | string | | Why locked. |
-| `reference_count` | integer | ≥0, default 1 | Same-scope re-learn count. Engram retires only at 0. |
+| `write_count` | integer | ≥0, default 1 | Same-scope re-learn count. Engram retires only at 0. Renamed from `reference_count` (#866); implementations MUST backfill on first parse. |
+| `injection_count` | integer | ≥0, default 0 | Number of times this engram was selected into a session's injection context. Distinct from `activation.frequency` (recall events). High injection_count + low positive feedback_signals is an efficacy-failure signal (#865, #866). |
 | `sources` | object[] | each: `scope` (R), `session_id?` (string\|null), `stored_at` (R, instant) | One entry per write attempt. |
 | `recurrence_count` | integer | ≥0, default 0 | Different-scope re-learn count (universality evidence). |
 | `engram_version` | integer | ≥1, default 1 | Content-evolution version. |
@@ -376,13 +438,14 @@ ignore the values.
 | `episode_ids` | string[] | default `[]` | Source episode IDs. |
 | `summary` | string | ≤80 chars | Injection-friendly short form. |
 | `pinned` | boolean | | Always-load flag; bypasses keyword gating. Use sparingly. |
+| `measured_under` | object | `model?`, `source_type?`, `hardware?`, `dataset?`, `date?` (ISO date) | Measurement conditions for numeric/benchmark engrams — which model, environment type, hardware tier, dataset, and date the value was recorded under. Allows tension-aware retrieval to treat differently-measured values as refinements rather than contradictions (#869). |
 
 ### 4.13 Required-field summary
 
 A minimally conformant engram is exactly:
 
 ```yaml
-id: ENG-2026-0506-001         # §3 grammar
+id: ENG-2026-05-06-001         # §3 grammar
 statement: "…"                # non-empty
 type: behavioral              # enum §4.2
 status: active                # enum §4.2
